@@ -13,6 +13,7 @@ for a single sequential non-flat extraction of the same 12 videos.
 Prints a human-readable list by default, or structured JSON with --json.
 """
 
+import os
 import sys
 import json
 import shutil
@@ -21,6 +22,9 @@ import argparse
 import datetime
 from concurrent.futures import ThreadPoolExecutor
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _throttle
+
 # yt-dlp's flat search extraction usually finishes in a few seconds; 60s covers
 # slow networks and larger --limit values without hanging indefinitely.
 SEARCH_TIMEOUT = 60
@@ -28,9 +32,17 @@ SEARCH_TIMEOUT = 60
 # Per-video metadata extraction is a separate, much smaller request.
 METADATA_TIMEOUT = 45
 
-# Concurrency for date hydration. 12 workers tested clean, but YouTube throttles
-# aggressive callers; 8 keeps the speedup without inviting bot detection.
-MAX_WORKERS = 8
+# Concurrency for date hydration. 12 workers is measurably faster and reliably
+# gets this IP blocked; 4 plus --sleep-requests keeps the burst under YouTube's
+# tolerance. Dates are a convenience -- losing them to a block costs far more
+# than the seconds saved. Wide sweeps should use --no-dates, not more workers.
+MAX_WORKERS = 4
+
+# Seconds yt-dlp waits between its own HTTP requests inside one extraction.
+SLEEP_REQUESTS = 0.75
+
+# Per-video requests in a single run beyond which a warning is warranted.
+LARGE_RUN_REQUESTS = 50
 
 # Date filters drop candidates, so over-fetch before filtering or a --limit 5
 # search over a narrow window would return almost nothing. The floor matters as
@@ -169,8 +181,14 @@ def flat_search(yt_dlp, query, count):
     return results, None
 
 
-def fetch_upload_date(yt_dlp, video_id):
-    """Extract one video's upload date as YYYYMMDD. Returns None if unavailable."""
+def fetch_upload_date(yt_dlp, video_id, breaker):
+    """Extract one video's upload date as YYYYMMDD. Returns None if unavailable.
+
+    Once `breaker` has tripped this spends no request at all: continuing to hammer
+    a blocked endpoint only prolongs the block.
+    """
+    if breaker.tripped:
+        return None
     cmd = [
         yt_dlp,
         f"https://www.youtube.com/watch?v={video_id}",
@@ -178,12 +196,17 @@ def fetch_upload_date(yt_dlp, video_id):
         "--skip-download",
         "--no-warnings",
         "--no-progress",
+        "--sleep-requests", str(SLEEP_REQUESTS),
+        "--extractor-retries", "1",
     ]
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=METADATA_TIMEOUT
         )
     except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0 and _throttle.is_block_error(result.stderr):
+        breaker.trip()
         return None
     value = result.stdout.strip().splitlines()
     if not value:
@@ -197,19 +220,27 @@ def fetch_upload_date(yt_dlp, video_id):
 def hydrate_dates(yt_dlp, results):
     """Fill in upload_date for each result, concurrently. Preserves input order.
 
-    Returns (results, failures). Failures are counted rather than swallowed: when
-    YouTube throttles, every lookup returns None, and a filtered search would
-    otherwise report "nothing matched your window" when the truth is "no dates
-    could be determined". Those two must never look alike.
+    Returns (results, failures, blocked). Failures are counted rather than
+    swallowed: when YouTube throttles, every lookup returns None, and a filtered
+    search would otherwise report "nothing matched your window" when the truth is
+    "no dates could be determined". Those two must never look alike.
     """
     if not results:
-        return results, 0
+        return results, 0, False
+    breaker = _throttle.Breaker()
     workers = min(MAX_WORKERS, len(results))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        dates = list(pool.map(lambda r: fetch_upload_date(yt_dlp, r["id"]), results))
+        dates = list(
+            pool.map(lambda r: fetch_upload_date(yt_dlp, r["id"], breaker), results)
+        )
     for result, date in zip(results, dates):
         result["upload_date"] = date
-    return results, sum(1 for d in dates if not d)
+    if any(dates) and not breaker.tripped:
+        # A successful lookup proves any *earlier* block has lifted. Never clear
+        # on a run that tripped: partial success before the block still means we
+        # are blocked now, and clearing would let the next run burst straight in.
+        _throttle.clear_block()
+    return results, sum(1 for d in dates if not d), breaker.tripped
 
 
 def main():
@@ -235,7 +266,12 @@ def main():
         "--max-candidates",
         type=int,
         help="Cap how many videos a filtered search examines "
-             "(default: max(40, --limit x 4))",
+             "(default: max(40, --limit x 2))",
+    )
+    parser.add_argument(
+        "--ignore-cooldown",
+        action="store_true",
+        help="Attempt per-video lookups even if YouTube blocked us recently",
     )
     args = parser.parse_args()
 
@@ -261,6 +297,25 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
+    # A recent block means per-video lookups will fail and each attempt prolongs
+    # it. The flat search itself survives throttling, so degrade to it rather
+    # than refusing outright -- except for a filter, which needs real dates.
+    cooling = 0 if (args.no_dates or args.ignore_cooldown) else \
+        _throttle.cooldown_remaining()
+    if cooling:
+        left = _throttle.format_cooldown(cooling)
+        if filtering:
+            print(f"Error: YouTube blocked per-video requests from this IP "
+                  f"recently; {left} of cooldown left. A date filter needs real "
+                  f"dates, and retrying now would extend the block. Wait, use "
+                  f"--no-dates without a filter, or override with "
+                  f"--ignore-cooldown.", file=sys.stderr)
+            sys.exit(1)
+        print(f"Warning: skipping upload-date lookups — blocked recently, {left} "
+              f"of cooldown left. Results have no dates; --ignore-cooldown "
+              f"overrides.", file=sys.stderr)
+        args.no_dates = True
+
     # Filtering discards candidates, so search wider than the caller asked for.
     candidates = args.limit
     if filtering:
@@ -284,9 +339,14 @@ def main():
     examined = len(results)
     unknown_date = 0
     failures = 0
+    blocked = False
 
     if not args.no_dates:
-        results, failures = hydrate_dates(yt_dlp, results)
+        if len(results) > LARGE_RUN_REQUESTS:
+            print(f"Warning: this run will make {len(results)} per-video requests, "
+                  f"which risks a temporary block. --no-dates does the same search "
+                  f"in one request.", file=sys.stderr)
+        results, failures, blocked = hydrate_dates(yt_dlp, results)
 
     # Mass lookup failure means YouTube is throttling, not that the videos are
     # undated. Filtering on top of that would manufacture a confident empty
@@ -294,16 +354,18 @@ def main():
     if failures and failures >= max(1, len(results) * DATE_FAILURE_THRESHOLD):
         detail = (f"{failures}/{len(results)} upload-date lookups failed"
                   if failures < len(results) else "every upload-date lookup failed")
+        if blocked:
+            detail += (f"; stopped early on bot detection and started a "
+                       f"{_throttle.format_cooldown(_throttle.cooldown_seconds())} "
+                       f"cooldown")
         if filtering:
-            print(f"Error: {detail} — YouTube is likely rate-limiting or blocking "
-                  f"this IP (bot detection). A date filter cannot be applied "
-                  f"without dates; results would look like 'no matches' when they "
-                  f"are really 'unknown'. Retry later, lower --limit, or drop the "
-                  f"date filter.", file=sys.stderr)
+            print(f"Error: {detail}. A date filter cannot be applied without "
+                  f"dates; results would look like 'no matches' when they are "
+                  f"really 'unknown'. Wait out the cooldown, or search with "
+                  f"--no-dates and no filter.", file=sys.stderr)
             sys.exit(1)
-        print(f"Warning: {detail} — those results show no date. YouTube is likely "
-              f"rate-limiting this IP; retry later or lower --limit.",
-              file=sys.stderr)
+        print(f"Warning: {detail}. Those results show no date; use --no-dates to "
+              f"skip the lookups entirely, or wait and retry.", file=sys.stderr)
 
     if filtering:
         kept = []

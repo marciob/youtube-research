@@ -15,8 +15,9 @@ metadata:
 
 # YouTube Research
 
-Turn a topic or question into an answer grounded in YouTube video content. Two self-contained
-`yt-dlp`-backed scripts do the fetching; this skill drives the research loop on top of them.
+Turn a topic or question into an answer grounded in YouTube video content. Two `yt-dlp`-backed
+scripts do the fetching (sharing `scripts/_throttle.py`, which tracks YouTube rate limiting);
+this skill drives the research loop on top of them.
 
 ## Requirements
 
@@ -111,9 +112,10 @@ These are defaults, not ceilings. `--limit` is passed straight through to YouTub
 when the user asks for exhaustive coverage.
 
 **The one real limit is request volume, not `--limit`.** The flat search is a single request no
-matter how large `--limit` is, but each upload date is a separate per-video request, and a few
-hundred of those in a burst trips YouTube's bot detection — after which *every* lookup fails
-until the block clears. So for wide sweeps:
+matter how large `--limit` is, but each upload date is a separate per-video request, and a burst
+of those trips YouTube's bot detection — after which *every* lookup fails until the block
+clears. Observed in practice at roughly 40 per-video requests in a few minutes. So for wide
+sweeps:
 
 - **Go wide with `--no-dates`** (one request, ~2s at any `--limit`), shortlist from titles and
   channels, and let the dates arrive with the transcripts — `get_transcript.py` reports the
@@ -126,6 +128,34 @@ until the block clears. So for wide sweeps:
 
 When the user explicitly asks for a wide search, say how wide you went — queries run, results
 seen, transcripts read — so the coverage is inspectable rather than implied.
+
+## Pacing (read before any large run)
+
+The scripts defend themselves — 4 concurrent workers, `--sleep-requests`, a breaker that stops
+issuing requests the moment a block appears, and a 15-minute cooldown persisted across
+invocations — but they cannot see the whole research session. You can. Budget your requests:
+
+| Action | Requests |
+|--------|----------|
+| Search with `--no-dates` | **1**, regardless of `--limit` |
+| Search with dates | 1 + one per result |
+| Filtered search | 1 + one per candidate (`max(40, --limit x 2)`) |
+| Each transcript | 1 |
+
+Rules that keep a session under the threshold:
+
+- **Spend requests on transcripts, not dates.** Transcripts are the actual research; dates come
+  free with them. A wide `--no-dates` sweep plus 10 transcripts is ~11 requests. The same sweep
+  with dates is ~60.
+- **One search at a time.** Never fan out searches in parallel — concurrent invocations do not
+  share the breaker, so each one discovers the block separately, at full cost.
+- **Space out multi-query research.** Three dated searches back to back is ~120 requests. Run
+  them with `--no-dates`, or accept dates on only the final narrowing search.
+- **When a block appears, stop.** Do not retry, do not "try one more video", do not pass
+  `--ignore-cooldown` to work around it. The cooldown exists because retrying extends the block.
+  Tell the user what you have and what is missing.
+- **A cooldown is not a research failure.** Searching still works during one, dateless. Say so
+  and continue rather than abandoning the task.
 
 ## Narrow paths
 

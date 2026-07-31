@@ -10,6 +10,9 @@ import tempfile
 import argparse
 import shutil
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _throttle
+
 
 def extract_video_id(url_or_id):
     """Extract video ID from URL or return as-is."""
@@ -123,12 +126,20 @@ def fetch_transcript(video_id, lang="en"):
                 "--skip-download",
                 "--no-warnings",
                 "--no-progress",
+                "--sleep-requests", "0.75",
+                "--extractor-retries", "1",
                 "-o", out_template,
                 url,
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
             if result.returncode != 0 and result.stderr.strip():
                 last_error = result.stderr.strip()
+                # Record the block so the next search backs off instead of
+                # bursting per-video requests against a blocked IP. Retrying the
+                # remaining caption languages would only prolong it.
+                if _throttle.is_block_error(last_error):
+                    _throttle.record_block()
+                    return [], None, last_error, meta
 
             if not meta:
                 meta = read_info_json(tmpdir)
@@ -141,6 +152,8 @@ def fetch_transcript(video_id, lang="en"):
                     entries = parse_json3(data)
                     if entries:
                         source = "manual" if "--write-sub" in sub_args else "auto"
+                        # Proof the IP is usable again; let searches resume dates.
+                        _throttle.clear_block()
                         return entries, source, None, meta
                     os.remove(fpath)
 
@@ -161,6 +174,17 @@ def main():
     args = parser.parse_args()
 
     video_id = extract_video_id(args.video)
+
+    # One transcript is a single extraction, so a cooldown warns rather than
+    # blocks -- the caller asked for this specific video. It does tell the agent
+    # to stop fanning out across many videos.
+    cooling = _throttle.cooldown_remaining()
+    if cooling:
+        print(f"Warning: YouTube blocked requests from this IP recently "
+              f"({_throttle.format_cooldown(cooling)} of cooldown left). "
+              f"Fetching this one anyway; avoid batching more transcripts until "
+              f"it clears.", file=sys.stderr)
+
     entries, source, error, meta = fetch_transcript(video_id, args.lang)
 
     if not entries:

@@ -6,8 +6,9 @@ relevant videos, pulls their transcripts, and synthesizes a cited answer with ti
 Also handles narrow asks: find videos by keyword/channel, or grab the transcript of a
 single video.
 
-Two self-contained `yt-dlp`-backed scripts do the fetching; [`SKILL.md`](SKILL.md) drives
-the research loop on top of them. **No API key needed.**
+Two `yt-dlp`-backed scripts do the fetching, sharing a small `_throttle.py` helper that
+tracks YouTube rate limiting; [`SKILL.md`](SKILL.md) drives the research loop on top of
+them. **No API key needed.**
 
 ## Requirements
 
@@ -42,11 +43,21 @@ sparse window is distinguishable from a search that simply stopped digging. Vide
 undeterminable upload date are excluded and counted, never silently kept.
 
 **Request volume is the real constraint.** The flat search is one request at any `--limit`, but
-each upload date is a separate per-video request, and a burst of a few hundred trips YouTube's
-bot detection. When that happens the scripts say so — and a filtered search exits non-zero
-rather than returning an empty list, since "no dates could be read" is not "no videos matched".
-For wide sweeps, search with `--no-dates` (one request, ~2s at any size) and take dates from
-`get_transcript.py` for the videos you actually read.
+each upload date is a separate per-video request, and a burst of them trips YouTube's bot
+detection — observed at roughly 40 in a few minutes. For wide sweeps, search with `--no-dates`
+(one request, ~2s at any size) and take dates from `get_transcript.py` for the videos you
+actually read.
+
+### Rate-limit handling
+
+- **Paced**: 4 concurrent workers, `--sleep-requests 0.75`, `--extractor-retries 1`.
+- **Circuit breaker**: the first block trips it and the run stops issuing requests instead of
+  firing the rest into a wall — measured 4 requests spent instead of 40.
+- **Cooldown**: a block is recorded to `~/.cache/youtube-research/state.json` for 15 minutes.
+  While it is active, dated searches degrade to dateless with a warning and filtered searches
+  refuse outright; `--no-dates` is unaffected. A later success clears it automatically.
+  Tune with `YTR_COOLDOWN_SECONDS` (0 disables) or bypass with `--ignore-cooldown`.
+- **Never mislabeled**: "no dates could be read" never renders as "no videos matched".
 
 YouTube's fast flat search carries no dates, so they are hydrated per video concurrently —
 about 4s for a search instead of 2s, versus ~17s for the sequential alternative. Use
