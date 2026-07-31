@@ -170,7 +170,8 @@ def flat_search(yt_dlp, query, count):
 
     if not results:
         err = result.stderr.strip()
-        if err and "Sign in to confirm" in err:
+        if _throttle.is_block_error(err):
+            _throttle.record_block()
             return None, (
                 "YouTube is blocking this request (bot detection) from this IP. "
                 "Try again later."
@@ -181,7 +182,7 @@ def flat_search(yt_dlp, query, count):
     return results, None
 
 
-def fetch_upload_date(yt_dlp, video_id, breaker):
+def fetch_upload_date(yt_dlp, video_id, breaker, cookies=None):
     """Extract one video's upload date as YYYYMMDD. Returns None if unavailable.
 
     Once `breaker` has tripped this spends no request at all: continuing to hammer
@@ -199,6 +200,8 @@ def fetch_upload_date(yt_dlp, video_id, breaker):
         "--sleep-requests", str(SLEEP_REQUESTS),
         "--extractor-retries", "1",
     ]
+    if cookies:
+        cmd[1:1] = ["--cookies-from-browser", cookies]
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=METADATA_TIMEOUT
@@ -217,7 +220,7 @@ def fetch_upload_date(yt_dlp, video_id, breaker):
     return value
 
 
-def hydrate_dates(yt_dlp, results):
+def hydrate_dates(yt_dlp, results, cookies=None):
     """Fill in upload_date for each result, concurrently. Preserves input order.
 
     Returns (results, failures, blocked). Failures are counted rather than
@@ -231,7 +234,10 @@ def hydrate_dates(yt_dlp, results):
     workers = min(MAX_WORKERS, len(results))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         dates = list(
-            pool.map(lambda r: fetch_upload_date(yt_dlp, r["id"], breaker), results)
+            pool.map(
+                lambda r: fetch_upload_date(yt_dlp, r["id"], breaker, cookies),
+                results,
+            )
         )
     for result, date in zip(results, dates):
         result["upload_date"] = date
@@ -267,6 +273,12 @@ def main():
         type=int,
         help="Cap how many videos a filtered search examines "
              "(default: max(40, --limit x 2))",
+    )
+    parser.add_argument(
+        "--cookies-from-browser",
+        metavar="BROWSER",
+        help="Load cookies from a browser (chrome, firefox, safari, ...) so "
+             "age-restricted videos still yield an upload date",
     )
     parser.add_argument(
         "--ignore-cooldown",
@@ -346,7 +358,9 @@ def main():
             print(f"Warning: this run will make {len(results)} per-video requests, "
                   f"which risks a temporary block. --no-dates does the same search "
                   f"in one request.", file=sys.stderr)
-        results, failures, blocked = hydrate_dates(yt_dlp, results)
+        results, failures, blocked = hydrate_dates(
+            yt_dlp, results, args.cookies_from_browser
+        )
 
     # Mass lookup failure means YouTube is throttling, not that the videos are
     # undated. Filtering on top of that would manufacture a confident empty

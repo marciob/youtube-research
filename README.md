@@ -22,8 +22,17 @@ python3 scripts/search_youtube.py "QUERY" [--limit N] [--json] [--no-dates] \
     [--after YYYY-MM-DD] [--before YYYY-MM-DD] [--recent day|week|month|year]
 
 # transcript
-python3 scripts/get_transcript.py "URL_OR_ID" [--timestamps] [--lang XX] [--json] [--no-header]
+python3 scripts/get_transcript.py "URL_OR_ID" [--timestamps] [--lang XX|orig] [--json] \
+    [--no-header] [--cookies-from-browser BROWSER]
 ```
+
+One transcript costs one extraction: manual and automatic captions are requested together
+with a language pattern, and the best track is chosen from whatever lands. YouTube offers
+~157 machine-translated caption languages per video, so `--lang en` on a Portuguese video
+returns a translation — the header names the actual track (`[en-orig]`, or
+`[en] — machine-translated from pt`) and `--json` exposes `track`, `original_lang`, and
+`translated`. Use `--lang orig` for the language actually spoken. Age-restricted videos
+need `--cookies-from-browser chrome`.
 
 `search_youtube.py` returns `id, title, channel, duration, view_count, upload_date, url`
 per result. `get_transcript.py` prints the transcript (`--timestamps` prefixes `[MM:SS]`)

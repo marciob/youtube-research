@@ -54,11 +54,27 @@ ran out first and more probably exist; re-run with a higher `--max-candidates` b
 anything about scarcity.
 
 **Transcript** — `scripts/get_transcript.py "URL_OR_ID" [--timestamps] [--lang XX] [--json]
-[--no-header]`. `--timestamps` prefixes each line with `[MM:SS]`; `--lang XX` sets caption
-language (default `en`); `--json` gives per-line start times. Text output opens with a `#` header
-carrying title, channel, upload date, duration, and caption type (manual vs auto) — pass
-`--no-header` for the bare transcript. `--json` returns the same metadata as fields.
+[--no-header] [--cookies-from-browser BROWSER]`. `--timestamps` prefixes each line with
+`[MM:SS]`; `--json` gives per-line start times. Text output opens with a `#` header carrying
+title, channel, upload date, duration, and which caption track was used — pass `--no-header` for
+the bare transcript. `--json` returns the same metadata as fields.
 **Never modify transcript wording** — you may re-wrap plain text into paragraphs, nothing more.
+
+**Caption fidelity.** YouTube offers ~157 machine-translated auto-caption languages per video, so
+`--lang en` on a Portuguese video returns a *translation of* Portuguese speech, not a transcript.
+One fetch pulls both the requested language and the original track, then picks: manual captions
+first, then the original ASR (`xx-orig`), then a translation. The header names the track — e.g.
+`auto captions (original) [en-orig]`, or `auto captions [en] — machine-translated from pt` — and
+`--json` exposes `track`, `original_lang`, and `translated`.
+
+- `--lang orig` fetches whatever language the video was actually spoken in. Prefer it when you
+  can read the result: translated captions compound ASR errors with translation errors.
+- When `translated` is true, say so in the synthesis and never quote such a line as the speaker's
+  exact words — it is machine output twice over.
+
+**Age-restricted videos** need an authenticated account: pass `--cookies-from-browser chrome`
+(or `firefox`, `safari`, `edge`). Both scripts accept it. This is a per-video permissions
+failure, never a rate-limit signal, and it does not start a cooldown.
 
 ## Default path: research a topic
 
@@ -140,7 +156,7 @@ invocations — but they cannot see the whole research session. You can. Budget 
 | Search with `--no-dates` | **1**, regardless of `--limit` |
 | Search with dates | 1 + one per result |
 | Filtered search | 1 + one per candidate (`max(40, --limit x 2)`) |
-| Each transcript | 1 |
+| Each transcript | **1** (manual and auto captions arrive in the same pass) |
 
 Rules that keep a session under the threshold:
 
@@ -185,6 +201,9 @@ Both scripts exit non-zero and print to stderr on failure:
   it. Do not quietly re-run unfiltered and present the results as if they met the constraint.
 - **"N skipped (upload date unavailable)"** — those videos were excluded from a filtered result
   because their date couldn't be confirmed. Mention it if the count is material.
+- **"age-restricted ... needs an authenticated account"** — not a rate limit and not a reason to
+  back off. Retry that one video with `--cookies-from-browser chrome`, or skip it and substitute
+  another source. Other videos are unaffected.
 - **"every upload-date lookup failed" / "N/M upload-date lookups failed"** — YouTube is
   throttling the per-video requests. A filtered search exits non-zero here rather than returning
   an empty list, because "no dates" and "no matches" are not the same claim. Fall back to

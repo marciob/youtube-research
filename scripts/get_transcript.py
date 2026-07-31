@@ -13,6 +13,10 @@ import shutil
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _throttle
 
+# Long talks plus --sleep-requests and a retry can outlast a short timeout, and
+# a timeout wastes the whole extraction. Generous, since it only bounds a hang.
+TRANSCRIPT_TIMEOUT = 180
+
 
 def extract_video_id(url_or_id):
     """Extract video ID from URL or return as-is."""
@@ -68,6 +72,72 @@ def format_duration(seconds):
     return f"{m}:{s:02d}"
 
 
+def sub_lang_pattern(lang):
+    """Build the --sub-langs pattern for a requested language.
+
+    Always includes `.*-orig`, the untranslated ASR track. YouTube offers ~157
+    machine-translated auto-caption languages per video, so asking for "en" on a
+    Portuguese video silently returns a translation. Pulling the original in the
+    same call makes that visible, and means a missing requested language does not
+    cost a second extraction.
+    """
+    if lang.lower() in ("orig", "original"):
+        return ".*-orig"
+    return f"{lang}.*,.*-orig"
+
+
+def track_langs(tmpdir, video_id):
+    """Map landed subtitle files to their language codes: {lang: path}."""
+    found = {}
+    prefix = f"{video_id}."
+    for fname in os.listdir(tmpdir):
+        if not fname.endswith(".json3") or not fname.startswith(prefix):
+            continue
+        code = fname[len(prefix):-len(".json3")]
+        found[code] = os.path.join(tmpdir, fname)
+    return found
+
+
+def choose_track(found, lang, manual_langs):
+    """Pick the best landed track. Returns (path, code, kind) or (None, None, None).
+
+    An explicit --lang wins over fidelity: asking for English on a Portuguese
+    video returns the English track, flagged as translated, rather than silently
+    handing back Portuguese. Within the requested language, manual captions beat
+    the original ASR, which beats a machine translation. The original track is
+    the fallback only when the requested language did not arrive at all -- that
+    is what keeps a language miss from costing a second extraction.
+    """
+    if not found:
+        return None, None, None
+    base = lang.lower()
+    asked_original = base in ("orig", "original")
+
+    def kind_of(code):
+        if code in manual_langs:
+            return "manual"
+        return "auto-original" if code.endswith("-orig") else "auto"
+
+    order = []
+    if not asked_original:
+        order += [c for c in found if c in manual_langs and c == lang]
+        order += [c for c in found if c in manual_langs and c.startswith(base)]
+        order += [c for c in found if c in manual_langs]
+        order += [c for c in found if c == f"{lang}-orig"]
+        order += [c for c in found if c == lang]
+        order += [c for c in found if c.startswith(base)]
+    order += [c for c in found if c.endswith("-orig")]
+    order += sorted(found)
+
+    seen = set()
+    for code in order:
+        if code in seen or code not in found:
+            continue
+        seen.add(code)
+        return found[code], code, kind_of(code)
+    return None, None, None
+
+
 def read_info_json(tmpdir):
     """Pull video metadata from the .info.json yt-dlp wrote alongside the subs."""
     for fname in os.listdir(tmpdir):
@@ -83,6 +153,9 @@ def read_info_json(tmpdir):
             upload_date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
         else:
             upload_date = None
+        manual_langs = sorted((d.get("subtitles") or {}).keys())
+        auto_langs = sorted((d.get("automatic_captions") or {}).keys())
+        original = next((c for c in auto_langs if c.endswith("-orig")), None)
         return {
             "title": d.get("title"),
             "channel": d.get("channel") or d.get("uploader"),
@@ -91,15 +164,26 @@ def read_info_json(tmpdir):
             "duration_string": format_duration(d.get("duration")),
             "view_count": d.get("view_count"),
             "url": d.get("webpage_url"),
+            "manual_langs": manual_langs,
+            "auto_langs": auto_langs,
+            # e.g. "pt-orig" -> the video was actually spoken in Portuguese
+            "original_lang": original[: -len("-orig")] if original else None,
         }
     return {}
 
 
-def fetch_transcript(video_id, lang="en"):
+def fetch_transcript(video_id, lang="en", cookies_from_browser=None):
     """Fetch transcript using yt-dlp with json3 format.
 
-    Returns (entries, source, error, meta). Metadata comes from --write-info-json,
-    which costs nothing extra: the subtitle fetch already extracts the video page.
+    Returns (entries, source, error, meta). One extraction, not three: requesting
+    manual and automatic captions together with a language pattern lands every
+    candidate track in a single pass, and the best one is chosen from what
+    arrived. The previous try-manual-then-auto-then-any loop re-extracted the
+    whole video page each round, costing 2 requests for the common auto-caption
+    case and 3 for a language miss.
+
+    Metadata comes from --write-info-json, which costs nothing extra: the
+    subtitle fetch already extracts the video page.
     """
     yt_dlp = shutil.which("yt-dlp")
     if not yt_dlp:
@@ -107,64 +191,87 @@ def fetch_transcript(video_id, lang="en"):
         sys.exit(1)
 
     url = f"https://www.youtube.com/watch?v={video_id}"
-    last_error = None
-    meta = {}
 
     with tempfile.TemporaryDirectory() as tmpdir:
         out_template = os.path.join(tmpdir, "%(id)s")
+        cmd = [
+            yt_dlp,
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-langs", sub_lang_pattern(lang),
+            "--sub-format", "json3",
+            "--write-info-json",
+            "--skip-download",
+            "--no-warnings",
+            "--no-progress",
+            "--sleep-requests", "0.75",
+            "--extractor-retries", "1",
+            "-o", out_template,
+            url,
+        ]
+        if cookies_from_browser:
+            cmd[1:1] = ["--cookies-from-browser", cookies_from_browser]
 
-        for sub_args in [
-            ["--write-sub", "--sub-lang", lang],
-            ["--write-auto-sub", "--sub-lang", lang],
-            ["--write-auto-sub"],
-        ]:
-            cmd = [
-                yt_dlp,
-                *sub_args,
-                "--sub-format", "json3",
-                "--write-info-json",
-                "--skip-download",
-                "--no-warnings",
-                "--no-progress",
-                "--sleep-requests", "0.75",
-                "--extractor-retries", "1",
-                "-o", out_template,
-                url,
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
-            if result.returncode != 0 and result.stderr.strip():
-                last_error = result.stderr.strip()
-                # Record the block so the next search backs off instead of
-                # bursting per-video requests against a blocked IP. Retrying the
-                # remaining caption languages would only prolong it.
-                if _throttle.is_block_error(last_error):
-                    _throttle.record_block()
-                    return [], None, last_error, meta
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=TRANSCRIPT_TIMEOUT
+            )
+        except subprocess.TimeoutExpired:
+            return [], None, f"timed out after {TRANSCRIPT_TIMEOUT}s", {}
 
-            if not meta:
-                meta = read_info_json(tmpdir)
+        meta = read_info_json(tmpdir)
+        err = result.stderr.strip()
 
-            for fname in os.listdir(tmpdir):
-                if fname.endswith(".json3"):
-                    fpath = os.path.join(tmpdir, fname)
-                    with open(fpath, "r") as f:
-                        data = json.load(f)
-                    entries = parse_json3(data)
-                    if entries:
-                        source = "manual" if "--write-sub" in sub_args else "auto"
-                        # Proof the IP is usable again; let searches resume dates.
-                        _throttle.clear_block()
-                        return entries, source, None, meta
-                    os.remove(fpath)
+        # Age restriction is a per-video permissions failure, not a rate signal:
+        # never record a block for it, and point at the fix.
+        if _throttle.is_age_restricted(err):
+            hint = ("" if cookies_from_browser else
+                    " Retry with --cookies-from-browser BROWSER (e.g. chrome).")
+            return [], None, f"age-restricted video.{hint}", meta
 
-    return [], None, last_error, meta
+        if _throttle.is_block_error(err):
+            _throttle.record_block()
+            return [], None, err, meta
+
+        found = track_langs(tmpdir, video_id)
+        manual = set(meta.get("manual_langs") or [])
+
+        fpath, code, kind = choose_track(found, lang, manual)
+
+        while fpath:
+            try:
+                with open(fpath, "r") as f:
+                    entries = parse_json3(json.load(f))
+            except (OSError, json.JSONDecodeError):
+                entries = []
+            if entries:
+                # Proof the IP is usable again; let searches resume dates.
+                _throttle.clear_block()
+                meta["track"] = code
+                meta["track_kind"] = kind
+                return entries, kind, None, meta
+            # Empty track: drop it and fall through to the next best candidate.
+            found.pop(code, None)
+            fpath, code, kind = choose_track(found, lang, manual)
+
+        return [], None, err or None, meta
 
 
 def main():
     parser = argparse.ArgumentParser(description="Get YouTube video transcript")
     parser.add_argument("video", help="YouTube URL or video ID")
     parser.add_argument("--timestamps", action="store_true", help="Include timestamps")
-    parser.add_argument("--lang", default="en", help="Language code (default: en)")
+    parser.add_argument(
+        "--lang",
+        default="en",
+        help="Language code (default: en), or 'orig' for the original spoken track",
+    )
+    parser.add_argument(
+        "--cookies-from-browser",
+        metavar="BROWSER",
+        help="Load cookies from a browser (chrome, firefox, safari, ...) to reach "
+             "age-restricted videos",
+    )
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument(
         "--no-header",
@@ -185,10 +292,18 @@ def main():
               f"Fetching this one anyway; avoid batching more transcripts until "
               f"it clears.", file=sys.stderr)
 
-    entries, source, error, meta = fetch_transcript(video_id, args.lang)
+    entries, source, error, meta = fetch_transcript(
+        video_id, args.lang, args.cookies_from_browser
+    )
 
     if not entries:
-        if error and "Sign in to confirm" in error:
+        if error and _throttle.is_age_restricted(error):
+            print(f"Error: {video_id} is age-restricted and needs an "
+                  f"authenticated account." +
+                  ("" if args.cookies_from_browser else
+                   " Retry with --cookies-from-browser chrome (or firefox, "
+                   "safari, edge)."), file=sys.stderr)
+        elif error and _throttle.is_block_error(error):
             print(f"Error: YouTube is blocking this request (bot detection). "
                   f"Video {video_id} cannot be accessed from this IP. "
                   f"Try again later or use a different video.", file=sys.stderr)
@@ -200,6 +315,16 @@ def main():
                   f"The video may not have captions enabled.", file=sys.stderr)
         sys.exit(1)
 
+    track = meta.get("track")
+    original_lang = meta.get("original_lang")
+    # A track that is neither manual nor the original ASR is a machine
+    # translation of speech in another language -- say so rather than passing it
+    # off as a plain transcript.
+    translated = bool(
+        source == "auto" and original_lang
+        and not (track or "").startswith(original_lang)
+    )
+
     if args.json:
         print(json.dumps({
             "video_id": video_id,
@@ -210,6 +335,9 @@ def main():
             "view_count": meta.get("view_count"),
             "url": meta.get("url") or f"https://www.youtube.com/watch?v={video_id}",
             "source": source,
+            "track": track,
+            "original_lang": original_lang,
+            "translated": translated,
             "entries": len(entries),
             "transcript": [
                 {"start": s, "text": t} for s, t in entries
@@ -218,7 +346,14 @@ def main():
         return
 
     if not args.no_header and meta:
-        captions = "manual captions" if source == "manual" else "auto captions"
+        captions = {
+            "manual": "manual captions",
+            "auto-original": "auto captions (original)",
+        }.get(source, "auto captions")
+        if track:
+            captions += f" [{track}]"
+        if translated:
+            captions += f" — machine-translated from {original_lang}"
         line2 = [x for x in (meta.get("channel"), meta.get("upload_date"),
                              meta.get("duration_string"), captions) if x]
         if meta.get("title"):

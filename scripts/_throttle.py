@@ -28,25 +28,52 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 # short enough that a real research session is not dead in the water.
 DEFAULT_COOLDOWN_SECONDS = 900
 
-# Substrings yt-dlp emits when YouTube is refusing us rather than when a video
-# genuinely lacks the field. Kept lowercase; the apostrophe appears as both
-# ASCII and U+2019 depending on the message.
+# Substrings that mean YouTube is refusing us for *rate* reasons.
+#
+# These are matched against text YouTube writes, not text yt-dlp writes, so the
+# phrasing is outside our control -- which is why none of them may be a prefix
+# of a longer, unrelated message. "sign in to confirm" was exactly that mistake:
+# it also matches the age gate, "Sign in to confirm your age", so a single
+# age-restricted video would record a block and stall every later run for 15
+# minutes over something cookies solve outright. Match "not a bot", which lands
+# after the apostrophe and so survives both ASCII ' and U+2019.
 BOT_BLOCK_MARKERS = (
-    "sign in to confirm",
     "not a bot",
     "http error 429",
     "too many requests",
-    "rate-limit",
-    "rate limit",
+    "rate-limit exceeded",
+)
+
+# Age restriction is a per-video authorization problem, never a rate problem.
+# It must never trip the breaker: the IP is fine and other videos still work.
+AGE_GATE_MARKERS = (
+    "confirm your age",
+    "age-restricted",
+    "age restricted",
+    "inappropriate for some users",
 )
 
 
 def is_block_error(text):
-    """True when stderr indicates throttling/blocking, not a missing field."""
+    """True when stderr indicates throttling/blocking, not a missing field.
+
+    Age-gated videos are explicitly excluded: they say "Sign in to confirm your
+    age", which is a permissions failure on one video, not a signal about the IP.
+    """
     if not text:
         return False
     low = text.lower()
+    if is_age_restricted(low):
+        return False
     return any(marker in low for marker in BOT_BLOCK_MARKERS)
+
+
+def is_age_restricted(text):
+    """True when a video needs an authenticated account (cookies), not a wait."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(marker in low for marker in AGE_GATE_MARKERS)
 
 
 def cooldown_seconds():
