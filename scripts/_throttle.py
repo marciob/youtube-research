@@ -76,6 +76,23 @@ def is_age_restricted(text):
     return any(marker in low for marker in AGE_GATE_MARKERS)
 
 
+def is_subtitle_rate_limit(text):
+    """True for a 429 on the subtitle CDN specifically, not a general block.
+
+    YouTube throttles machine-translated caption tracks far harder than original
+    ASR tracks: a video whose `en` translation 429s serves its `pt-orig` track
+    seconds later, and page extraction keeps working throughout. Treating that as
+    an IP-wide block would start a cooldown that stops upload-date lookups on an
+    endpoint which is demonstrably fine.
+    """
+    if not text:
+        return False
+    low = text.lower()
+    if "subtitle" not in low or "unable to download" not in low:
+        return False
+    return "429" in low or "too many requests" in low
+
+
 def cooldown_seconds():
     """Cooldown length; override with YTR_COOLDOWN_SECONDS (0 disables)."""
     raw = os.environ.get("YTR_COOLDOWN_SECONDS")

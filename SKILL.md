@@ -67,10 +67,22 @@ first, then the original ASR (`xx-orig`), then a translation. The header names t
 `auto captions (original) [en-orig]`, or `auto captions [en] — machine-translated from pt` — and
 `--json` exposes `track`, `original_lang`, and `translated`.
 
-- `--lang orig` fetches whatever language the video was actually spoken in. Prefer it when you
-  can read the result: translated captions compound ASR errors with translation errors.
+- `--lang orig` fetches whatever language the video was actually spoken in. Prefer it for any
+  non-English video: translated captions compound ASR errors with translation errors, **and
+  YouTube throttles translated tracks far harder than original ones** — they are generated on
+  demand. A video whose `en` track returns HTTP 429 serves its `pt-orig` track seconds later.
+  For a foreign-language corpus, `--lang orig` is the reliable path, not just the faithful one.
+- If a translated track is throttled the script retries once against the original and labels
+  what it got. That is a per-track limit, not an IP block, so it starts no cooldown.
 - When `translated` is true, say so in the synthesis and never quote such a line as the speaker's
   exact words — it is machine output twice over.
+
+**Metadata is resilient, not guaranteed.** Title, channel, upload date, duration and view count
+are printed by the extraction itself and survive a later failure; `.info.json` is written near
+the end of a run and is missing whenever anything fails after extraction. When it is missing the
+header says `captions [xx]` rather than `auto captions [xx]`, because the manual-vs-automatic
+inventory is genuinely unknown — do not restate it as either. A transcript with an empty title is
+still a valid transcript; report the gap instead of dropping the source.
 
 **Age-restricted videos** need an authenticated account: pass `--cookies-from-browser chrome`
 (or `firefox`, `safari`, `edge`). Both scripts accept it. This is a per-video permissions

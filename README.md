@@ -26,13 +26,24 @@ python3 scripts/get_transcript.py "URL_OR_ID" [--timestamps] [--lang XX|orig] [-
     [--no-header] [--cookies-from-browser BROWSER]
 ```
 
-One transcript costs one extraction: manual and automatic captions are requested together
-with a language pattern, and the best track is chosen from whatever lands. YouTube offers
-~157 machine-translated caption languages per video, so `--lang en` on a Portuguese video
-returns a translation — the header names the actual track (`[en-orig]`, or
-`[en] — machine-translated from pt`) and `--json` exposes `track`, `original_lang`, and
-`translated`. Use `--lang orig` for the language actually spoken. Age-restricted videos
-need `--cookies-from-browser chrome`.
+One transcript costs one extraction and one subtitle download: manual and automatic
+captions are requested together with a language pattern, and the best track is chosen from
+whatever lands. YouTube offers ~157 machine-translated caption languages per video, so
+`--lang en` on a Portuguese video returns a translation — the header names the actual track
+(`[en-orig]`, or `[en] — machine-translated from pt`) and `--json` exposes `track`,
+`original_lang`, and `translated`. Age-restricted videos need `--cookies-from-browser chrome`.
+
+**Use `--lang orig` for non-English videos.** Translated caption tracks are generated on
+demand and throttled far harder than original ones: a video whose `en` track returns HTTP
+429 serves its `pt-orig` track seconds later. When a translated track is throttled the
+script retries once against the original — that is a per-track limit, not an IP block, so
+it starts no cooldown.
+
+Metadata (title, channel, upload date, duration, views) is printed by the extraction itself
+rather than read only from `.info.json`, which yt-dlp writes near the end of a run and skips
+entirely when anything fails afterwards. Transcripts therefore keep their metadata even when
+the run half-fails. Where `.info.json` is missing, the manual-vs-automatic inventory is
+unknown and the header says `captions [xx]` instead of asserting either.
 
 `search_youtube.py` returns `id, title, channel, duration, view_count, upload_date, url`
 per result. `get_transcript.py` prints the transcript (`--timestamps` prefixes `[MM:SS]`)

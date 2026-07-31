@@ -17,6 +17,66 @@ import _throttle
 # a timeout wastes the whole extraction. Generous, since it only bounds a hang.
 TRANSCRIPT_TIMEOUT = 180
 
+# Metadata is printed to stdout as one tagged line, and only *then* read from
+# .info.json. yt-dlp writes that file near the end of a run, so anything that
+# fails late -- a no-formats video, or a 429 from the subtitle CDN after the
+# extraction itself succeeded -- leaves subtitles on disk and no metadata at all.
+# Observed: an error on the subtitle download aborted the run with zero files
+# written, despite the page extraction having already returned title and date.
+#
+# --print alone would be a trap: it implies --simulate, which stops yt-dlp
+# writing any subtitle file, yielding perfect metadata and an empty transcript.
+# --no-simulate is what makes the two coexist.
+#
+# The separator is ASCII US (0x1f), which cannot occur in a YouTube title.
+META_TAG = "YTRMETA"
+META_SEP = "\x1f"
+META_FIELDS = ("id", "title", "channel", "upload_date", "duration",
+               "view_count", "webpage_url", "language")
+
+
+def print_template():
+    """One tagged, separator-delimited line carrying the core metadata."""
+    return META_TAG + META_SEP + META_SEP.join(f"%({f})s" for f in META_FIELDS)
+
+
+def parse_printed_meta(stdout):
+    """Parse the tagged --print line. Returns {} when it is absent."""
+    for line in (stdout or "").splitlines():
+        if not line.startswith(META_TAG + META_SEP):
+            continue
+        parts = line.rstrip("\n").split(META_SEP)
+        if len(parts) != len(META_FIELDS) + 1:
+            continue
+        out = {}
+        for name, raw in zip(META_FIELDS, parts[1:]):
+            value = raw.strip()
+            # yt-dlp prints "NA" for fields it could not resolve.
+            out[name] = None if value in ("", "NA", "None") else value
+        upload = out.get("upload_date")
+        if upload and len(upload) == 8 and upload.isdigit():
+            out["upload_date"] = f"{upload[:4]}-{upload[4:6]}-{upload[6:]}"
+        else:
+            out["upload_date"] = None
+        for numeric in ("duration", "view_count"):
+            try:
+                out[numeric] = int(float(out[numeric])) if out[numeric] else None
+            except (TypeError, ValueError):
+                out[numeric] = None
+        return {
+            "title": out["title"],
+            "channel": out["channel"],
+            "upload_date": out["upload_date"],
+            "duration": out["duration"],
+            "duration_string": format_duration(out["duration"]),
+            "view_count": out["view_count"],
+            "url": out["webpage_url"],
+            # Audio language, used to flag a translated caption track without
+            # spending a request on the original.
+            "spoken_lang": out["language"],
+        }
+    return {}
+
 
 def extract_video_id(url_or_id):
     """Extract video ID from URL or return as-is."""
@@ -72,18 +132,21 @@ def format_duration(seconds):
     return f"{m}:{s:02d}"
 
 
+ORIGINAL_PATTERN = ".*-orig"
+
+
 def sub_lang_pattern(lang):
     """Build the --sub-langs pattern for a requested language.
 
-    Always includes `.*-orig`, the untranslated ASR track. YouTube offers ~157
-    machine-translated auto-caption languages per video, so asking for "en" on a
-    Portuguese video silently returns a translation. Pulling the original in the
-    same call makes that visible, and means a missing requested language does not
-    cost a second extraction.
+    Only the requested language is downloaded. Pulling `.*-orig` alongside it
+    would double the requests against the subtitle CDN, which is the endpoint
+    that rate-limits: a video whose `en` track 429s serves its `pt-orig` track
+    fine seconds later. Knowing a transcript is translated needs the video's
+    language, not the original track's bytes, and metadata already carries that.
     """
     if lang.lower() in ("orig", "original"):
-        return ".*-orig"
-    return f"{lang}.*,.*-orig"
+        return ORIGINAL_PATTERN
+    return f"{lang}.*"
 
 
 def track_langs(tmpdir, video_id):
@@ -196,11 +259,20 @@ def fetch_transcript(video_id, lang="en", cookies_from_browser=None):
         out_template = os.path.join(tmpdir, "%(id)s")
         cmd = [
             yt_dlp,
+            "--print", print_template(),
+            # --print implies --simulate, which would suppress every subtitle
+            # file. Without this line the script returns metadata and an empty
+            # transcript.
+            "--no-simulate",
             "--write-subs",
             "--write-auto-subs",
             "--sub-langs", sub_lang_pattern(lang),
             "--sub-format", "json3",
             "--write-info-json",
+            # A video exposing no downloadable formats otherwise hard-errors
+            # before any subtitle is written, losing a transcript that was
+            # perfectly reachable. --skip-download means we want none of them.
+            "--ignore-no-formats-error",
             "--skip-download",
             "--no-warnings",
             "--no-progress",
@@ -219,7 +291,14 @@ def fetch_transcript(video_id, lang="en", cookies_from_browser=None):
         except subprocess.TimeoutExpired:
             return [], None, f"timed out after {TRANSCRIPT_TIMEOUT}s", {}
 
-        meta = read_info_json(tmpdir)
+        # Printed metadata is primary because it survives late failures;
+        # info.json only fills gaps and supplies the caption inventory.
+        info = read_info_json(tmpdir)
+        meta = dict(info)
+        meta["inventory_known"] = bool(info)
+        for key, value in parse_printed_meta(result.stdout).items():
+            if value is not None:
+                meta[key] = value
         err = result.stderr.strip()
 
         # Age restriction is a per-video permissions failure, not a rate signal:
@@ -229,11 +308,47 @@ def fetch_transcript(video_id, lang="en", cookies_from_browser=None):
                     " Retry with --cookies-from-browser BROWSER (e.g. chrome).")
             return [], None, f"age-restricted video.{hint}", meta
 
-        if _throttle.is_block_error(err):
+        # A 429 confined to the subtitle CDN is not an IP-wide block: the
+        # original track and the extraction endpoint keep working. Fall through
+        # to the retry below instead of starting a cooldown over it.
+        sub_limited = _throttle.is_subtitle_rate_limit(err)
+        if _throttle.is_block_error(err) and not sub_limited:
             _throttle.record_block()
             return [], None, err, meta
 
         found = track_langs(tmpdir, video_id)
+
+        # Either the requested language does not exist for this video, or its
+        # machine-translated track was throttled. Both are worth one retry
+        # against the original track, which YouTube serves far more reliably --
+        # and both are rare, so this beats paying an extra subtitle download on
+        # every video to pre-empt them.
+        if not found and lang.lower() not in ("orig", "original"):
+            retry = list(cmd)
+            retry[retry.index("--sub-langs") + 1] = ORIGINAL_PATTERN
+            try:
+                result = subprocess.run(
+                    retry, capture_output=True, text=True,
+                    timeout=TRANSCRIPT_TIMEOUT
+                )
+            except subprocess.TimeoutExpired:
+                return [], None, f"timed out after {TRANSCRIPT_TIMEOUT}s", meta
+            err = result.stderr.strip()
+            # The original track failing too means the pressure is not confined
+            # to translated captions after all.
+            if _throttle.is_block_error(err):
+                _throttle.record_block()
+                return [], None, err, meta
+            found = track_langs(tmpdir, video_id)
+
+        # Original language, cheapest source first: the info.json inventory, then
+        # the printed audio language, then whatever `*-orig` file landed.
+        if not meta.get("original_lang"):
+            landed_orig = next((c for c in found if c.endswith("-orig")), None)
+            meta["original_lang"] = (
+                meta.get("spoken_lang")
+                or (landed_orig[: -len("-orig")] if landed_orig else None)
+            )
         manual = set(meta.get("manual_langs") or [])
 
         fpath, code, kind = choose_track(found, lang, manual)
@@ -346,10 +461,16 @@ def main():
         return
 
     if not args.no_header and meta:
-        captions = {
-            "manual": "manual captions",
-            "auto-original": "auto captions (original)",
-        }.get(source, "auto captions")
+        if meta.get("inventory_known", True):
+            captions = {
+                "manual": "manual captions",
+                "auto-original": "auto captions (original)",
+            }.get(source, "auto captions")
+        else:
+            # No info.json: the manual/automatic inventory is unknown, so do not
+            # assert which one this is.
+            captions = ("captions (original)" if source == "auto-original"
+                        else "captions")
         if track:
             captions += f" [{track}]"
         if translated:
