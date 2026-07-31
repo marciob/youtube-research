@@ -52,8 +52,52 @@ def format_timestamp(seconds):
     return f"[{m}:{s:02d}]"
 
 
+def format_duration(seconds):
+    """Format a duration in seconds as M:SS or H:MM:SS. Returns None if unknown."""
+    if not seconds:
+        return None
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def read_info_json(tmpdir):
+    """Pull video metadata from the .info.json yt-dlp wrote alongside the subs."""
+    for fname in os.listdir(tmpdir):
+        if not fname.endswith(".info.json"):
+            continue
+        try:
+            with open(os.path.join(tmpdir, fname), "r") as f:
+                d = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        upload_date = d.get("upload_date")
+        if upload_date and len(upload_date) == 8 and upload_date.isdigit():
+            upload_date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
+        else:
+            upload_date = None
+        return {
+            "title": d.get("title"),
+            "channel": d.get("channel") or d.get("uploader"),
+            "upload_date": upload_date,
+            "duration": d.get("duration"),
+            "duration_string": format_duration(d.get("duration")),
+            "view_count": d.get("view_count"),
+            "url": d.get("webpage_url"),
+        }
+    return {}
+
+
 def fetch_transcript(video_id, lang="en"):
-    """Fetch transcript using yt-dlp with json3 format."""
+    """Fetch transcript using yt-dlp with json3 format.
+
+    Returns (entries, source, error, meta). Metadata comes from --write-info-json,
+    which costs nothing extra: the subtitle fetch already extracts the video page.
+    """
     yt_dlp = shutil.which("yt-dlp")
     if not yt_dlp:
         print("Error: yt-dlp not found. Install with: brew install yt-dlp", file=sys.stderr)
@@ -61,6 +105,7 @@ def fetch_transcript(video_id, lang="en"):
 
     url = f"https://www.youtube.com/watch?v={video_id}"
     last_error = None
+    meta = {}
 
     with tempfile.TemporaryDirectory() as tmpdir:
         out_template = os.path.join(tmpdir, "%(id)s")
@@ -74,6 +119,7 @@ def fetch_transcript(video_id, lang="en"):
                 yt_dlp,
                 *sub_args,
                 "--sub-format", "json3",
+                "--write-info-json",
                 "--skip-download",
                 "--no-warnings",
                 "--no-progress",
@@ -84,6 +130,9 @@ def fetch_transcript(video_id, lang="en"):
             if result.returncode != 0 and result.stderr.strip():
                 last_error = result.stderr.strip()
 
+            if not meta:
+                meta = read_info_json(tmpdir)
+
             for fname in os.listdir(tmpdir):
                 if fname.endswith(".json3"):
                     fpath = os.path.join(tmpdir, fname)
@@ -92,10 +141,10 @@ def fetch_transcript(video_id, lang="en"):
                     entries = parse_json3(data)
                     if entries:
                         source = "manual" if "--write-sub" in sub_args else "auto"
-                        return entries, source, None
+                        return entries, source, None, meta
                     os.remove(fpath)
 
-    return [], None, last_error
+    return [], None, last_error, meta
 
 
 def main():
@@ -104,10 +153,15 @@ def main():
     parser.add_argument("--timestamps", action="store_true", help="Include timestamps")
     parser.add_argument("--lang", default="en", help="Language code (default: en)")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument(
+        "--no-header",
+        action="store_true",
+        help="Omit the title/channel/upload-date header from text output",
+    )
     args = parser.parse_args()
 
     video_id = extract_video_id(args.video)
-    entries, source, error = fetch_transcript(video_id, args.lang)
+    entries, source, error, meta = fetch_transcript(video_id, args.lang)
 
     if not entries:
         if error and "Sign in to confirm" in error:
@@ -125,13 +179,31 @@ def main():
     if args.json:
         print(json.dumps({
             "video_id": video_id,
+            "title": meta.get("title"),
+            "channel": meta.get("channel"),
+            "upload_date": meta.get("upload_date"),
+            "duration": meta.get("duration"),
+            "view_count": meta.get("view_count"),
+            "url": meta.get("url") or f"https://www.youtube.com/watch?v={video_id}",
             "source": source,
             "entries": len(entries),
             "transcript": [
                 {"start": s, "text": t} for s, t in entries
             ],
         }))
-    elif args.timestamps:
+        return
+
+    if not args.no_header and meta:
+        captions = "manual captions" if source == "manual" else "auto captions"
+        line2 = [x for x in (meta.get("channel"), meta.get("upload_date"),
+                             meta.get("duration_string"), captions) if x]
+        if meta.get("title"):
+            print(f"# {meta['title']}")
+        print(f"# {'  ·  '.join(line2)}")
+        print(f"# {meta.get('url') or f'https://www.youtube.com/watch?v={video_id}'}")
+        print()
+
+    if args.timestamps:
         for start, text in entries:
             print(f"{format_timestamp(start)} {text}")
     else:
