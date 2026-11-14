@@ -62,8 +62,9 @@ the bare transcript. `--json` returns the same metadata as fields.
 
 **Caption fidelity.** YouTube offers ~157 machine-translated auto-caption languages per video, so
 `--lang en` on a Portuguese video returns a *translation of* Portuguese speech, not a transcript.
-One fetch pulls both the requested language and the original track, then picks: manual captions
-first, then the original ASR (`xx-orig`), then a translation. The header names the track — e.g.
+One fetch pulls only the requested language; when that language is missing or throttled, the
+script retries once against the original track. It picks manual captions first, then the original
+ASR (`xx-orig`), then a translation. The header names the track — e.g.
 `auto captions (original) [en-orig]`, or `auto captions [en] — machine-translated from pt` — and
 `--json` exposes `track`, `original_lang`, and `translated`.
 
